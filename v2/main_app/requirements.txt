@@ -23,5 +23,5 @@ pyyaml
 pyAesCrypt
 pytz==2023.3
 validators
-Werkzeug==2.3.4
+Werkzeug==3.1.6
 sendgrid
