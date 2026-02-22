@@ -28,7 +28,6 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const https = require('https');
             const { execFileSync } = require('child_process');
 
             const prNumber = context.payload.pull_request.number;
@@ -126,7 +125,7 @@ jobs:
             let analysis = '';
             try {
               const requestBody = JSON.stringify({
-                model: 'openai/gpt-4o',
+                model: 'openai/gpt-4o-mini',
                 messages: [
                   {
                     role: 'system',
@@ -145,39 +144,35 @@ jobs:
                 temperature: 0.1
               });
 
-              const aiResponse = await new Promise((resolve, reject) => {
-                const req = https.request(
-                  {
-                    hostname: 'models.github.ai',
-                    path: '/inference/chat/completions',
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
-                      'Content-Length': Buffer.byteLength(requestBody)
-                    }
-                  },
-                  res => {
-                    let data = '';
-                    res.on('data', chunk => data += chunk);
-                    res.on('end', () => {
-                      try { resolve(JSON.parse(data)); }
-                      catch (parseErr) {
-                        console.log('Failed to parse Models API response:', parseErr.message);
-                        resolve({ _raw: data });
-                      }
-                    });
-                  }
-                );
-                req.on('error', reject);
-                req.write(requestBody);
-                req.end();
+              const response = await fetch('https://models.github.ai/inference/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+                },
+                body: requestBody,
+                signal: AbortSignal.timeout(60000)
               });
+
+              const responseText = await response.text();
+              let aiResponse;
+              try {
+                aiResponse = JSON.parse(responseText);
+              } catch (parseErr) {
+                console.log(`Failed to parse Models API response (HTTP ${response.status}):`, responseText.slice(0, 500));
+                throw new Error(`Models API returned non-JSON response (HTTP ${response.status})`);
+              }
+
+              if (!response.ok) {
+                const errMsg = aiResponse.error ? aiResponse.error.message : JSON.stringify(aiResponse).slice(0, 300);
+                console.log(`Models API error (HTTP ${response.status}):`, errMsg);
+                throw new Error(`Models API returned HTTP ${response.status}: ${errMsg}`);
+              }
 
               if (aiResponse.choices && aiResponse.choices[0]) {
                 analysis = aiResponse.choices[0].message.content;
               } else {
-                console.log('Unexpected Models API response:', JSON.stringify(aiResponse).slice(0, 500));
+                console.log('Unexpected Models API response structure (HTTP ' + response.status + '):', JSON.stringify(aiResponse).slice(0, 500));
                 analysis =
                   `> ⚠️ Copilot analysis could not be completed automatically.\n\n` +
                   `Please review the \`${packageName}\` upgrade from \`${oldVersion}\` to \`${newVersion}\` manually.`;
