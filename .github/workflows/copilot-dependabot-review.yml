@@ -126,7 +126,7 @@ jobs:
             let analysis = '';
             try {
               const requestBody = JSON.stringify({
-                model: 'openai/gpt-4o',
+                model: 'gpt-4o',
                 messages: [
                   {
                     role: 'system',
