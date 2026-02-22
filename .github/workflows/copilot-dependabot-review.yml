@@ -1,4 +1,4 @@
-name: Copilot Dependabot PR Review
+name: Dependabot Dependency Analysis
 
 on:
   pull_request:
@@ -9,13 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  copilot-dependabot-review:
-    name: Request Copilot Review for Dependabot PRs
+  dependabot-analysis:
+    name: Analyze Dependabot Dependency Upgrade
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]' || github.actor == 'dependabot'
 
     steps:
-      - name: Request Copilot as Reviewer
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract dependency change info
+        id: extract
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -23,21 +29,412 @@ jobs:
             const prNumber = context.payload.pull_request.number;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prTitle = context.payload.pull_request.title;
 
-            console.log(`Dependabot PR detected: #${prNumber} - ${prTitle}`);
+            // Fetch the PR diff
+            const diffResponse = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+            const changedFiles = diffResponse.data;
 
-            // Request Copilot as a reviewer so it can analyze the dependency upgrade
-            // Copilot will follow the analysis instructions in .github/copilot-instructions.md
-            try {
-              await github.rest.pulls.requestReviewers({
-                owner,
-                repo,
-                pull_number: prNumber,
-                reviewers: ['copilot']
-              });
-              console.log('Successfully requested Copilot review');
-            } catch (error) {
-              console.log('Note: Could not automatically add Copilot as a reviewer:', error.message);
-              console.log('Please manually add Copilot as a reviewer on this PR.');
+            // Manifest file patterns and their ecosystems
+            const ecosystemMap = [
+              { pattern: /^(.*\/)?requirements.*\.txt$/i,        ecosystem: 'pip' },
+              { pattern: /^(.*\/)?setup\.cfg$/i,                 ecosystem: 'pip' },
+              { pattern: /^(.*\/)?Pipfile(\.lock)?$/i,           ecosystem: 'pip' },
+              { pattern: /^(.*\/)?pyproject\.toml$/i,            ecosystem: 'pip' },
+              { pattern: /^(.*\/)?package(-lock)?\.json$/i,      ecosystem: 'npm' },
+              { pattern: /^(.*\/)?yarn\.lock$/i,                 ecosystem: 'npm' },
+              { pattern: /^(.*\/)?Gemfile(\.lock)?$/i,           ecosystem: 'rubygems' },
+              { pattern: /^(.*\/)?Cargo(\.lock)?\.toml$/i,       ecosystem: 'cargo' },
+              { pattern: /^(.*\/)?Cargo\.toml$/i,                ecosystem: 'cargo' },
+              { pattern: /^(.*\/)?go\.mod$/i,                    ecosystem: 'gomod' },
+              { pattern: /^(.*\/)?.+\.csproj$/i,                 ecosystem: 'nuget' },
+              { pattern: /^(.*\/)?packages\.config$/i,           ecosystem: 'nuget' },
+              { pattern: /^(.*\/)?pom\.xml$/i,                   ecosystem: 'maven' },
+              { pattern: /^(.*\/)?build\.gradle(\.kts)?$/i,      ecosystem: 'gradle' },
+              { pattern: /^(.*\/)?composer\.json$/i,             ecosystem: 'packagist' },
+            ];
+
+            const packages = [];
+
+            for (const file of changedFiles) {
+              let ecosystem = 'unknown';
+              for (const { pattern, ecosystem: eco } of ecosystemMap) {
+                if (pattern.test(file.filename)) { ecosystem = eco; break; }
+              }
+
+              const patch = file.patch || '';
+
+              // Parse removed (-) and added (+) version lines from the diff
+              const removedLines = patch.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---'));
+              const addedLines  = patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++'));
+
+              // Version extraction helpers per ecosystem
+              const extractPkg = (lines, eco) => {
+                const results = [];
+                for (const line of lines) {
+                  const content = line.slice(1).trim();
+                  let m;
+                  if (eco === 'pip') {
+                    // requirements.txt: package==1.2.3 or package[extra]>=1.2.3
+                    m = content.match(/^([A-Za-z0-9_\-\.\[\]]+)\s*[=><!~^]+\s*([\w\.\-\+]+)/);
+                    if (m) results.push({ name: m[1].replace(/\[.*\]/, '').toLowerCase(), version: m[2] });
+                  } else if (eco === 'npm') {
+                    // package.json: "package": "1.2.3" or "^1.2.3" (only semver-like values)
+                    m = content.match(/"([^"]+)"\s*:\s*"[\^~]?([\d][^"]*\d[^"]*)"/);
+                    if (m && m[1] !== 'version' && /^[\d]/.test(m[2])) results.push({ name: m[1], version: m[2] });
+                  } else if (eco === 'rubygems') {
+                    // Gemfile: gem 'package', '~> 1.2'
+                    m = content.match(/gem\s+['"]([^'"]+)['"]\s*,\s*['"][~>= ]*([\d][^'"]*)['"]/);
+                    if (m) results.push({ name: m[1], version: m[2].trim() });
+                  } else if (eco === 'cargo') {
+                    // Cargo.toml: package = "1.2.3" (skip version = "x" standalone lines)
+                    m = content.match(/^([a-z0-9_\-]+)\s*=\s*"([\d][^"]+)"/);
+                    if (m && m[1] !== 'version') results.push({ name: m[1], version: m[2] });
+                  } else if (eco === 'gomod') {
+                    // go.mod: require github.com/foo/bar v1.2.3
+                    m = content.match(/^\s*([^\s]+)\s+v([\d][^\s]*)/);
+                    if (m) results.push({ name: m[1], version: m[2] });
+                  } else if (eco === 'nuget') {
+                    // .csproj: <PackageReference Include="Foo" Version="1.2.3" />
+                    m = content.match(/Include="([^"]+)"[^>]*Version="([\d][^"]+)"/i);
+                    if (!m) m = content.match(/id="([^"]+)"[^>]*version="([\d][^"]+)"/i);
+                    if (m) results.push({ name: m[1], version: m[2] });
+                  } else if (eco === 'maven' || eco === 'gradle') {
+                    // gradle: 'group:artifact:version' or "group:artifact:version"
+                    m = content.match(/['"]([^'"]+):([^'"]+):([\d][^'"]+)['"]/);
+                    if (m) results.push({ name: `${m[1]}:${m[2]}`, version: m[3] });
+                  } else if (eco === 'packagist') {
+                    m = content.match(/"([^"\/]+\/[^"]+)"\s*:\s*"[\^~]?([\d][^"]+)"/);
+                    if (m) results.push({ name: m[1], version: m[2] });
+                  } else {
+                    // generic: look for version-like changes
+                    m = content.match(/([A-Za-z0-9_\-\.]+)[^\d]+([\d]+\.[.\d]+)/);
+                    if (m) results.push({ name: m[1], version: m[2] });
+                  }
+                }
+                return results;
+              };
+
+              const oldPkgs = extractPkg(removedLines, ecosystem);
+              const newPkgs = extractPkg(addedLines,   ecosystem);
+
+              for (const newPkg of newPkgs) {
+                const oldMatch = oldPkgs.find(o => o.name === newPkg.name);
+                if (oldMatch && oldMatch.version !== newPkg.version) {
+                  packages.push({
+                    name: newPkg.name,
+                    oldVersion: oldMatch.version,
+                    newVersion: newPkg.version,
+                    ecosystem,
+                    manifestFile: file.filename
+                  });
+                }
+              }
             }
+
+            // Deduplicate by name+ecosystem
+            const seen = new Set();
+            const unique = packages.filter(p => {
+              const key = `${p.ecosystem}:${p.name}`;
+              if (seen.has(key)) return false;
+              seen.add(key); return true;
+            });
+
+            console.log('Detected packages:', JSON.stringify(unique));
+            core.setOutput('packages', JSON.stringify(unique));
+            core.setOutput('pr_number', String(prNumber));
+
+      - name: Analyze and comment
+        uses: actions/github-script@v7
+        env:
+          PACKAGES: ${{ steps.extract.outputs.packages }}
+          PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+            const https = require('https');
+
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const prNumber = parseInt(process.env.PR_NUMBER || context.payload.pull_request.number);
+            let packages = [];
+            try { packages = JSON.parse(process.env.PACKAGES || '[]'); } catch (_) {}
+
+            // ---------- helpers ----------
+
+            function semverMajor(v) {
+              if (!v) return null;
+              const m = String(v).match(/^v?(\d+)/);
+              return m ? parseInt(m[1], 10) : null;
+            }
+
+            function httpsGet(url) {
+              return new Promise((resolve, reject) => {
+                const options = { headers: { 'User-Agent': 'github-actions-dependabot-analysis/1.0' } };
+                https.get(url, options, res => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    try { resolve(JSON.parse(data)); }
+                    catch (_) { resolve({ _raw: data }); }
+                  });
+                }).on('error', reject);
+              });
+            }
+
+            function containsBreakingKeywords(text) {
+              if (!text) return false;
+              return /\b(breaking|removes?|removed|renamed?|deprecated|incompatible|drop(ped)?|deleted?|deletes?)\b/i.test(text);
+            }
+
+            // Scan codebase for package usage
+            function scanUsage(pkgName) {
+              // Sanitize: strip all shell metacharacters for safe interpolation
+              const safeName = pkgName.replace(/[^A-Za-z0-9_\-\./@]/g, '');
+              if (!safeName) return [];
+              // Build grep patterns depending on common usage styles
+              const patterns = [
+                `import ${safeName}`, `from ${safeName}`, `require('${safeName}`, `require("${safeName}`,
+              ];
+              const excludeDirs = '--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=vendor --exclude-dir=__pycache__ --exclude-dir=.tox --exclude-dir=dist --exclude-dir=build --exclude-dir=.venv';
+              const matches = new Set();
+              for (const pat of patterns) {
+                try {
+                  const out = execSync(
+                    `grep -rn ${excludeDirs} --include="*.py" --include="*.js" --include="*.ts" --include="*.go" --include="*.rs" --include="*.rb" --include="*.java" --include="*.cs" --include="*.php" -F "${pat}" . 2>/dev/null || true`,
+                    { cwd: process.env.GITHUB_WORKSPACE || '.', encoding: 'utf8', timeout: 15000 }
+                  );
+                  out.split('\n').filter(Boolean).forEach(l => matches.add(l.trim()));
+                } catch (_) {}
+              }
+              // Fallback: broader name search if no specific matches
+              if (matches.size === 0) {
+                try {
+                  const out = execSync(
+                    `grep -rn ${excludeDirs} -F "${safeName}" . 2>/dev/null | head -30 || true`,
+                    { cwd: process.env.GITHUB_WORKSPACE || '.', encoding: 'utf8', timeout: 15000 }
+                  );
+                  out.split('\n').filter(Boolean).forEach(l => matches.add(l.trim()));
+                } catch (_) {}
+              }
+              return Array.from(matches).slice(0, 20);
+            }
+
+            // Fetch changelog info per ecosystem
+            async function fetchChangelog(pkg) {
+              const { name, ecosystem, oldVersion, newVersion } = pkg;
+              let url = '';
+              let breakingNotes = [];
+              let releaseNotesUrl = '';
+
+              try {
+                if (ecosystem === 'pip') {
+                  url = `https://pypi.org/pypi/${encodeURIComponent(name)}/json`;
+                  releaseNotesUrl = `https://pypi.org/project/${encodeURIComponent(name)}/#history`;
+                  const data = await httpsGet(url);
+                  const info = data.info || {};
+                  const desc = (info.description || '') + ' ' + (info.summary || '');
+                  if (containsBreakingKeywords(desc)) breakingNotes.push('PyPI description mentions breaking changes.');
+                  // Check release descriptions for versions between old and new
+                  const releases = data.releases || {};
+                  for (const [ver, files] of Object.entries(releases)) {
+                    for (const f of files) {
+                      if (f.comment_text && containsBreakingKeywords(f.comment_text)) {
+                        breakingNotes.push(`v${ver}: ${f.comment_text.slice(0, 200)}`);
+                      }
+                    }
+                  }
+
+                } else if (ecosystem === 'npm') {
+                  url = `https://registry.npmjs.org/${encodeURIComponent(name)}`;
+                  releaseNotesUrl = `https://www.npmjs.com/package/${encodeURIComponent(name)}`;
+                  const data = await httpsGet(url);
+                  const versions = data.versions || {};
+                  for (const [ver, meta] of Object.entries(versions)) {
+                    const notes = (meta.description || '') + ' ' + JSON.stringify(meta.deprecated || '');
+                    if (containsBreakingKeywords(notes)) {
+                      breakingNotes.push(`v${ver}: ${notes.slice(0, 200)}`);
+                    }
+                  }
+                  const latest = (data['dist-tags'] || {}).latest;
+                  if (data.readme && containsBreakingKeywords(data.readme)) {
+                    breakingNotes.push('README mentions breaking changes (see npm page).');
+                  }
+
+                } else if (ecosystem === 'rubygems') {
+                  url = `https://rubygems.org/api/v1/versions/${encodeURIComponent(name)}.json`;
+                  releaseNotesUrl = `https://rubygems.org/gems/${encodeURIComponent(name)}`;
+                  const data = await httpsGet(url);
+                  if (Array.isArray(data)) {
+                    for (const v of data) {
+                      const notes = v.description || v.summary || '';
+                      if (containsBreakingKeywords(notes)) {
+                        breakingNotes.push(`v${v.number}: ${notes.slice(0, 200)}`);
+                      }
+                    }
+                  }
+
+                } else if (ecosystem === 'cargo') {
+                  url = `https://crates.io/api/v1/crates/${encodeURIComponent(name)}`;
+                  releaseNotesUrl = `https://crates.io/crates/${encodeURIComponent(name)}`;
+                  const data = await httpsGet(url);
+                  const versions = (data.versions || []);
+                  for (const v of versions) {
+                    if (v.yanked) breakingNotes.push(`v${v.num} was yanked (likely broken).`);
+                  }
+                  const desc = (data.crate || {}).description || '';
+                  if (containsBreakingKeywords(desc)) breakingNotes.push('Crate description mentions breaking changes.');
+
+                } else if (ecosystem === 'gomod') {
+                  // name is full module path like github.com/foo/bar
+                  // Encode each path segment individually, preserving slashes
+                  const encodedPath = name.split('/').map(seg => encodeURIComponent(seg)).join('/');
+                  url = `https://proxy.golang.org/${encodedPath}/@v/list`;
+                  releaseNotesUrl = `https://pkg.go.dev/${name}`;
+                  const data = await httpsGet(url);
+                  // Go proxy just returns a list of versions as text
+                  const rawVersions = (data._raw || '').split('\n').filter(Boolean);
+                  console.log(`Go module ${name} versions: ${rawVersions.slice(0, 5).join(', ')}`);
+
+                } else if (ecosystem === 'nuget') {
+                  const lowerName = name.toLowerCase();
+                  url = `https://api.nuget.org/v3-flatcontainer/${encodeURIComponent(lowerName)}/index.json`;
+                  releaseNotesUrl = `https://www.nuget.org/packages/${encodeURIComponent(name)}`;
+                  const data = await httpsGet(url);
+                  // NuGet index just returns versions list; no changelog here
+                  console.log(`NuGet ${name} available versions count: ${(data.versions || []).length}`);
+
+                } else if (ecosystem === 'maven' || ecosystem === 'gradle') {
+                  const parts = name.split(':');
+                  const artifact = parts[1] || parts[0];
+                  const group = parts[0] || '';
+                  const q = group ? `a:${artifact}+AND+g:${group}` : `a:${artifact}`;
+                  url = `https://search.maven.org/solrsearch/select?q=${q}&rows=5&wt=json`;
+                  releaseNotesUrl = group
+                    ? `https://search.maven.org/artifact/${group}/${artifact}`
+                    : `https://search.maven.org/search?q=${artifact}`;
+                  const data = await httpsGet(url);
+                  console.log(`Maven search results for ${name}: ${JSON.stringify((data.response || {}).numFound)}`);
+
+                } else if (ecosystem === 'packagist') {
+                  const slashIdx = name.indexOf('/');
+                  const vendor = slashIdx >= 0 ? name.slice(0, slashIdx) : name;
+                  const pkg2   = slashIdx >= 0 ? name.slice(slashIdx + 1) : '';
+                  if (vendor && pkg2) {
+                    url = `https://repo.packagist.org/p2/${encodeURIComponent(vendor)}/${encodeURIComponent(pkg2)}.json`;
+                    releaseNotesUrl = `https://packagist.org/packages/${name}`;
+                    const data = await httpsGet(url);
+                    const pkgData = (data.packages || {})[name] || [];
+                    for (const v of pkgData) {
+                      const notes = v.description || '';
+                      if (containsBreakingKeywords(notes)) {
+                        breakingNotes.push(`v${v.version}: ${notes.slice(0, 200)}`);
+                      }
+                    }
+                  }
+                }
+              } catch (err) {
+                console.log(`Failed to fetch changelog for ${name} (${ecosystem}): ${err.message}`);
+                return { breakingNotes: [], releaseNotesUrl, error: err.message };
+              }
+
+              // Deduplicate
+              breakingNotes = [...new Set(breakingNotes)].slice(0, 5);
+              return { breakingNotes, releaseNotesUrl, error: null };
+            }
+
+            // ---------- main ----------
+
+            if (!packages || packages.length === 0) {
+              // Fallback: try to parse from PR title (e.g. "Bump foo from 1.0 to 2.0")
+              const title = context.payload.pull_request.title || '';
+              const m = title.match(/bump\s+([^\s]+)\s+from\s+(v?[\d][^\s]*)\s+to\s+(v?[\d][^\s]*)/i);
+              if (m) {
+                packages = [{ name: m[1], oldVersion: m[2], newVersion: m[3], ecosystem: 'unknown', manifestFile: 'unknown' }];
+              }
+            }
+
+            if (!packages || packages.length === 0) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: [
+                  '## 🤖 Dependabot Dependency Analysis',
+                  '',
+                  '> ⚠️ Could not detect any dependency changes in this PR diff.',
+                  '> Please review the changes manually.',
+                ].join('\n')
+              });
+              return;
+            }
+
+            const commentSections = ['## 🤖 Dependabot Dependency Analysis\n'];
+
+            for (const pkg of packages) {
+              const { name, oldVersion, newVersion, ecosystem, manifestFile } = pkg;
+              const oldMajor = semverMajor(oldVersion);
+              const newMajor = semverMajor(newVersion);
+              const isMajorBump = oldMajor !== null && newMajor !== null && newMajor > oldMajor;
+
+              const { breakingNotes, releaseNotesUrl, error } = await fetchChangelog(pkg);
+              const usages = scanUsage(name);
+
+              const hasIssues = isMajorBump || breakingNotes.length > 0;
+              const header = hasIssues ? '⚠️' : '✅';
+
+              const table = [
+                `| Field | Value |`,
+                `|-------|-------|`,
+                `| **Package** | \`${name}\` |`,
+                `| **Ecosystem** | ${ecosystem} |`,
+                `| **Manifest** | \`${manifestFile}\` |`,
+                `| **Version Change** | \`${oldVersion}\` → \`${newVersion}\` |`,
+                `| **Major Version Bump** | ${isMajorBump ? '⚠️ Yes' : 'No'} |`,
+              ].join('\n');
+
+              let section = `### ${header} \`${name}\` (${oldVersion} → ${newVersion})\n\n${table}\n`;
+
+              if (hasIssues) {
+                section += '\n### ⚠️ Potential Breaking Changes\n';
+                if (breakingNotes.length > 0) {
+                  section += breakingNotes.map(n => `- ${n}`).join('\n') + '\n';
+                } else {
+                  section += '_No specific breaking-change keywords found in registry data, but this is a **major version bump** — review the changelog carefully._\n';
+                }
+              } else {
+                section += '\nNo breaking changes detected in the changelog for this upgrade.\n';
+              }
+
+              if (ecosystem === 'unknown') {
+                section += '\n> ⚠️ Could not determine the package ecosystem from the manifest file. Changelog could not be fetched automatically.\n';
+              } else if (error) {
+                section += `\n> ⚠️ Could not fetch changelog from registry: \`${error}\`\n`;
+              }
+
+              section += '\n### 📁 Codebase Usage\n';
+              if (usages.length > 0) {
+                section += 'The following files reference this package:\n';
+                section += usages.map(u => `- \`${u}\``).join('\n') + '\n';
+                if (hasIssues) {
+                  section += '\n> **Action Required:** Review the breaking changes above against the listed file usages before merging.\n';
+                }
+              } else {
+                section += 'No direct imports found in the codebase.\n';
+              }
+
+              if (releaseNotesUrl) {
+                section += `\n### 📋 Release Notes\n[View release notes / changelog](${releaseNotesUrl})\n`;
+              }
+
+              commentSections.push(section);
+              if (packages.indexOf(pkg) < packages.length - 1) {
+                commentSections.push('---\n');
+              }
+            }
+
+            const body = commentSections.join('\n');
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber, body
+            });
+            console.log('Posted analysis comment on PR #' + prNumber);
