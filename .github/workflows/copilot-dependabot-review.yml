@@ -164,7 +164,7 @@ jobs:
               }
 
               if (!response.ok) {
-                const errMsg = aiResponse.error ? aiResponse.error.message : JSON.stringify(aiResponse).slice(0, 300);
+                const errMsg = (aiResponse && aiResponse.error && aiResponse.error.message) || JSON.stringify(aiResponse).slice(0, 300);
                 console.log(`Models API error (HTTP ${response.status}):`, errMsg);
                 throw new Error(`Models API returned HTTP ${response.status}: ${errMsg}`);
               }
@@ -172,7 +172,7 @@ jobs:
               if (aiResponse.choices && aiResponse.choices[0]) {
                 analysis = aiResponse.choices[0].message.content;
               } else {
-                console.log('Unexpected Models API response structure (HTTP ' + response.status + '):', JSON.stringify(aiResponse).slice(0, 500));
+                console.log(`Unexpected Models API response structure (HTTP ${response.status}):`, JSON.stringify(aiResponse).slice(0, 500));
                 analysis =
                   `> ⚠️ Copilot analysis could not be completed automatically.\n\n` +
                   `Please review the \`${packageName}\` upgrade from \`${oldVersion}\` to \`${newVersion}\` manually.`;
