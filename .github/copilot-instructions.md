@@ -40,3 +40,17 @@
    ```bash
    git clone https://github.com/chancemelby/cyberarena.git
    cd cyberarena
+
+## Dependabot Pull Requests Reviews
+
+- When dependabot is the author of a pull request
+- Check the current version of the dependency
+- Check the secure version of the dependency
+- Check the versions in between the current version and secure version of dependecy
+- Analyze release notes and changelog for each version checked
+- Identify any changes with methods, classes, or property names
+- Example: Current Version - dependency.Calculate() works - Version Update - Calculate() is removed
+- Check the repository for any reference to deprecated or changed methods, classes, or property names
+- Comment on code review any breaking changes that would affect the upgrade to secure version
+- If no breaking changes are identified, state that
+  
