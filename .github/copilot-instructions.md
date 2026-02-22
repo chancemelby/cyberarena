@@ -41,16 +41,64 @@
    git clone https://github.com/chancemelby/cyberarena.git
    cd cyberarena
 
-## Dependabot Pull Requests Reviews
+## Copilot Code Review for Dependabot Security Updates
 
-- When dependabot is the author of a pull request
-- Check the current version of the dependency
-- Check the secure version of the dependency
-- Check the versions in between the current version and secure version of dependecy
-- Analyze release notes and changelog for each version checked
-- Identify any changes with methods, classes, or property names
-- Example: Current Version - dependency.Calculate() works - Version Update - Calculate() is removed
-- Check the repository for any reference to deprecated or changed methods, classes, or property names
-- Comment on code review any breaking changes that would affect the upgrade to secure version
-- If no breaking changes are identified, state that
-  
+**Purpose:**  
+When Copilot is added as a code reviewer to dependabot pull requests, automatically analyze the dependency upgrade for breaking changes that could affect the codebase. Provide developers with clear visibility into whether the security update is safe to merge or requires code changes.
+
+**Trigger:**  
+- Pull request author is `dependabot` or `dependabot[bot]`
+- Pull request updates a dependency to a secure version
+
+**Analysis Process:**
+
+1. **Identify Dependency Changes**
+   - Extract the current dependency version from the PR
+   - Extract the target (secure) version dependabot is upgrading to
+   - Identify all intermediate versions between current and secure version
+
+2. **Review Release Notes & Changelogs**
+   - For each version in the upgrade path, analyze release notes and changelogs
+   - Focus specifically on breaking changes including:
+     - Removed or renamed methods
+     - Removed or renamed classes
+     - Changed or removed properties
+     - Modified configuration options
+     - API changes
+
+3. **Scan Repository for Breaking Changes**
+   - Search the entire codebase for references to methods, classes, or properties that will be removed/changed
+   - Example: If the upgrade removes `dependency.Calculate()` method, search the repo for all usages of `Calculate()`
+   - If found, identify the specific files and line numbers affected
+
+4. **Post Code Review Comment**
+
+   **If breaking changes are detected:**
+   ```
+   ⚠️ **Breaking Changes Detected in Dependency Upgrade**
+
+   This upgrade includes breaking changes that would affect the codebase:
+
+   **Breaking Change:** [Method/Class/Property Name] has been [removed/renamed/changed]
+   
+   **Impact:** The following code references would break:
+   - [File path and line number]
+   - [File path and line number]
+   
+   **Required Action:** Update the code to use the new method/class/property name or implement an alternative before merging this upgrade.
+   
+   **Recommended Changes:**
+   [Provide specific guidance on how to fix the issue]
+   ```
+
+   **If no breaking changes are detected:**
+   ```
+   ✅ **No Breaking Changes Detected**
+
+   This dependency upgrade to [version] does not introduce any breaking changes to the codebase. Safe to merge.
+   ```
+
+5. **Additional Considerations**
+   - Flag any deprecated warnings in the changelog (not breaking changes, but worth noting)
+   - If major version upgrades occur, provide extra scrutiny
+   - Include links to the official release notes or changelog for developer reference
