@@ -126,7 +126,7 @@ jobs:
             let analysis = '';
             try {
               const requestBody = JSON.stringify({
-                model: 'gpt-4o',
+                model: 'openai/gpt-4o',
                 messages: [
                   {
                     role: 'system',
@@ -148,8 +148,8 @@ jobs:
               const aiResponse = await new Promise((resolve, reject) => {
                 const req = https.request(
                   {
-                    hostname: 'models.inference.ai.azure.com',
-                    path: '/chat/completions',
+                    hostname: 'models.github.ai',
+                    path: '/inference/chat/completions',
                     method: 'POST',
                     headers: {
                       'Content-Type': 'application/json',
