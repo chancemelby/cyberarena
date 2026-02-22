@@ -46,6 +46,8 @@
 **Purpose:**  
 When Copilot is added as a code reviewer to dependabot pull requests, automatically analyze the dependency upgrade for breaking changes that could affect the codebase. Provide developers with clear visibility into whether the security update is safe to merge or requires code changes.
 
+This process applies universally regardless of the programming language (e.g., Python, JavaScript, Java, Go, Ruby, Rust, C#) or package ecosystem (e.g., pip, npm, Maven, Gradle, Go modules, NuGet, Cargo, Composer, RubyGems).
+
 **Trigger:**  
 - Pull request author is `dependabot` or `dependabot[bot]`
 - Pull request updates a dependency to a secure version
@@ -53,21 +55,21 @@ When Copilot is added as a code reviewer to dependabot pull requests, automatica
 **Analysis Process:**
 
 1. **Identify Dependency Changes**
-   - Extract the current dependency version from the PR
-   - Extract the target (secure) version dependabot is upgrading to
+   - Extract the package name, current version, and target (secure) version from the PR title and description
    - Identify all intermediate versions between current and secure version
+   - Determine the package ecosystem from the PR metadata or changed manifest files (e.g., `requirements.txt`, `package.json`, `pom.xml`, `go.mod`, `Cargo.toml`, `*.csproj`)
 
 2. **Review Release Notes & Changelogs**
-   - For each version in the upgrade path, analyze release notes and changelogs
+   - For each version in the upgrade path, analyze release notes and changelogs from the package's official source (PyPI, npm, Maven Central, crates.io, NuGet, pkg.go.dev, etc.)
    - Focus specifically on breaking changes including:
-     - Removed or renamed methods
-     - Removed or renamed classes
-     - Changed or removed properties
-     - Modified configuration options
+     - Removed or renamed methods, functions, or procedures
+     - Removed or renamed classes, types, or interfaces
+     - Changed or removed properties, fields, or configuration options
+     - Modified function signatures or return types
      - API changes
 
 3. **Scan Repository for Breaking Changes**
-   - Search the entire codebase for references to methods, classes, or properties that will be removed/changed
+   - Search the entire codebase — across all files and all languages present in the repository — for references to methods, classes, types, or properties that will be removed or changed
    - Example: If the upgrade removes `dependency.Calculate()` method, search the repo for all usages of `Calculate()`
    - If found, identify the specific files and line numbers affected
 
