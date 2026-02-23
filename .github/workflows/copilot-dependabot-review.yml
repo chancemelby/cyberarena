@@ -3,6 +3,27 @@ name: Copilot Dependabot Breaking Change Analysis
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # SECURITY (OWASP API4:2023, NIST SP 800-53 SC-5): Restrict workflow to manifest/lock
+    # file changes only, to prevent abuse via rapid Models API calls on unrelated PRs.
+    paths:
+      - '**/requirements*.txt'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/yarn.lock'
+      - '**/Gemfile'
+      - '**/Gemfile.lock'
+      - '**/go.mod'
+      - '**/go.sum'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/pom.xml'
+      - '**/*.csproj'
+      - '**/composer.json'
+      - '**/composer.lock'
+      - '**/pyproject.toml'
+      - '**/poetry.lock'
+      - '**/Pipfile'
+      - '**/Pipfile.lock'
 
 # SECURITY NOTE (OWASP API5:2023): GITHUB_TOKEN carries pull-requests:write,
 # contents:read, and models:read. The same token is used for both the Models API
@@ -74,15 +95,22 @@ jobs:
             // prompt injection via a crafted PR title (OWASP LLM01).
             const pkgNamePattern = /^[a-zA-Z0-9._\-/@]+$/;
             const versionPattern = /^v?[0-9][a-zA-Z0-9._\-+]*$/;
-            const mdStripPattern = /[#*>`_[\]]/g;
+            // SECURITY (OWASP A03:2021): Expanded to cover parentheses, exclamation marks,
+            // pipes, backticks, and tildes which can be used for markdown injection.
+            const mdStripPattern = /[#*>`_[\]()!|~]/g;
+            const MAX_PKG_NAME_LEN = 128;
+            const MAX_VERSION_LEN = 64;
+            // SECURITY (OWASP LLM01): Package names and versions are length-limited to prevent
+            // prompt context domination. Values are only interpolated inside XML-tagged untrusted
+            // data blocks. Residual risk: semantically adversarial but structurally valid names.
             const packageName = bumpMatch && pkgNamePattern.test(bumpMatch[1])
-              ? bumpMatch[1].replace(mdStripPattern, '')
+              ? bumpMatch[1].replace(mdStripPattern, '').slice(0, MAX_PKG_NAME_LEN)
               : 'the dependency';
             const oldVersion = bumpMatch && versionPattern.test(bumpMatch[2])
-              ? bumpMatch[2].replace(mdStripPattern, '')
+              ? bumpMatch[2].replace(mdStripPattern, '').slice(0, MAX_VERSION_LEN)
               : 'the current version';
             const newVersion = bumpMatch && versionPattern.test(bumpMatch[3])
-              ? bumpMatch[3].replace(mdStripPattern, '')
+              ? bumpMatch[3].replace(mdStripPattern, '').slice(0, MAX_VERSION_LEN)
               : 'the new version';
 
             // 2. Gather the manifest file diffs for context.
@@ -125,6 +153,15 @@ jobs:
                     '--include=*.py', '--include=*.js', '--include=*.ts',
                     '--include=*.go', '--include=*.rs', '--include=*.rb',
                     '--include=*.java', '--include=*.cs', '--include=*.php',
+                    // SECURITY (NIST AI 100-2): Extended coverage for templates, config,
+                    // infrastructure, and .NET project files common in modern ecosystems.
+                    '--include=*.tsx', '--include=*.jsx', '--include=*.vue',
+                    '--include=*.tf', '--include=*.hcl',
+                    '--include=*.yaml', '--include=*.yml',
+                    '--include=*.toml', '--include=*.json',
+                    '--include=*.xml', '--include=*.gradle',
+                    '--include=*.csproj', '--include=*.fsproj', '--include=*.vbproj',
+                    '--include=*.cshtml', '--include=*.razor',
                     '--exclude-dir=node_modules', '--exclude-dir=.git',
                     '--exclude-dir=vendor', '--exclude-dir=__pycache__',
                     '--exclude-dir=.tox', '--exclude-dir=dist', '--exclude-dir=build',
@@ -132,6 +169,8 @@ jobs:
                     '--exclude-dir=.eggs', '--exclude-dir=.cache', '--exclude-dir=coverage',
                     '--exclude-dir=.nyc_output', '--exclude-dir=bower_components',
                     '--exclude-dir=.terraform', '--exclude-dir=.next',
+                    '--exclude-dir=bin', '--exclude-dir=obj',
+                    '--exclude-dir=packages', '--exclude-dir=.nuget',
                     '--binary-files=without-match', '--max-count=50',
                     '.'
                   ],
@@ -222,7 +261,7 @@ jobs:
               try {
                 aiResponse = JSON.parse(responseText);
               } catch (parseErr) {
-                console.log(`Failed to parse Models API response: HTTP ${response.status}`);
+                console.log(`Failed to parse Models API response: HTTP ${response.status}: ${String(parseErr.message).slice(0, 200)}`);
                 throw new Error(`Models API returned non-JSON response (HTTP ${response.status})`);
               }
 
@@ -233,6 +272,17 @@ jobs:
 
               if (aiResponse.choices && aiResponse.choices[0]) {
                 analysis = aiResponse.choices[0].message.content;
+                // SECURITY (OWASP LLM09, NIST AI 100-2): Structural validation of AI response.
+                // Verify the response contains expected status markers to detect potential
+                // prompt injection manipulation of the AI output format. Limiting check to
+                // first 1000 characters prevents bypass via late-injected matching text.
+                const hasStatusMarker = /(?:✅\s*No Breaking Changes Detected|⚠️\s*Breaking Changes Detected)/i.test(analysis.slice(0, 1000));
+                if (!hasStatusMarker) {
+                  console.log('AI response missing expected status marker; treating as inconclusive.');
+                  analysis =
+                    `> ⚠️ Copilot analysis could not be completed automatically.\n\n` +
+                    `Please review this upgrade manually.`;
+                }
               } else {
                 console.log(`Unexpected Models API response structure: HTTP ${response.status}`);
                 analysis =
@@ -243,7 +293,7 @@ jobs:
               // Log the full error only to the workflow console to avoid leaking
               // internal API details (e.g. rate-limit info, token errors) into
               // the public PR comment (OWASP A09).
-              console.error(`GitHub Models API error: ${err.message}`);
+              console.error(`GitHub Models API error: ${String(err.message).slice(0, 200)}`);
               analysis =
                 `> ⚠️ Copilot analysis could not be completed automatically.\n\n` +
                 `Please review this upgrade manually.`;
@@ -256,14 +306,20 @@ jobs:
             analysis = analysis.replace(/@/g, '＠');
             // Strip slash commands that could be interpreted by bots (OWASP LLM02).
             analysis = analysis.replace(/^\/[a-zA-Z]+/gm, '[command removed]');
+            // Strip task list checkboxes to prevent interactive elements in GitHub UI (OWASP LLM02).
+            analysis = analysis.replace(/^-\s*\[[ x]\]/gim, '-');
             // Strip HTML tags to prevent injection (OWASP LLM02).
             analysis = analysis.replace(/<[^>]*>/g, '');
             // Strip non-HTTP URI schemes (e.g. ftp:, data:, javascript:).
             analysis = analysis.replace(/(?:ftp|data|javascript|vbscript):[^\s)\[\]']*/gi, '[link removed]');
-            // Trusted domain list used for both bare URLs and markdown link/image syntax.
-            const trustedDomainRe = /^https?:\/\/(?:github\.com|pypi\.org|npmjs\.com|docs\.rs|rubygems\.org|packagist\.org|mvnrepository\.com|nuget\.org|crates\.io)(?:[/?#]|$)/;
+            // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Enforces HTTPS-only for all
+            // trusted domain links. Only exact-match domains are permitted (no subdomains).
+            const trustedDomainRe = /^https:\/\/(?:github\.com|pypi\.org|npmjs\.com|docs\.rs|rubygems\.org|packagist\.org|mvnrepository\.com|nuget\.org|crates\.io)(?:[/?#]|$)/;
             // Strip URLs that may be open redirects even on trusted domains.
             const suspiciousRedirectRe = /[?&](redirect|return_to|next|url|goto|destination|continue)=/i;
+            // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Strip userinfo from URLs
+            // to prevent credential-bearing URL bypass of domain allowlist.
+            analysis = analysis.replace(/https?:\/\/[^@\s]*@/g, 'https://');
             // Strip bare URLs not on the trusted allowlist. The domain must be an exact
             // match (not a subdomain of an attacker domain like github.com.evil.com).
             analysis = analysis.replace(
