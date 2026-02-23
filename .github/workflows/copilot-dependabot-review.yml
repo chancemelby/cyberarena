@@ -42,8 +42,12 @@ jobs:
     concurrency:
       group: copilot-dependabot-${{ github.event.pull_request.number }}
       cancel-in-progress: true
+    # SECURITY (OWASP API2:2023): Use pull_request.user.login instead of github.actor.
+    # github.actor reflects who triggered the event (can differ on synchronize events),
+    # while user.login is the PR author — preventing non-Dependabot actors from running
+    # the workflow by pushing to a dependabot/-prefixed branch.
     if: >-
-      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
       startsWith(github.head_ref, 'dependabot/')
 
     steps:
@@ -120,9 +124,22 @@ jobs:
 
             let diffContext = '';
             const DIFF_CONTEXT_MAX = 8000;
-            // Strip comment-only lines from patches to reduce prompt injection surface (OWASP LLM01).
+            // SECURITY (OWASP LLM01, NIST AI 100-2): Strip patch lines to actual diff hunk
+            // lines only. Non-diff-format lines (e.g. bare strings, description fields)
+            // could carry attacker-controlled prompt injection content from package manifests.
+            // We keep: hunk headers (@@), file headers (+++/---), added (+), removed (-), and
+            // context lines (space-prefixed). Within those, comment-only lines are also removed.
             const stripComments = (patch) => patch.split('\n')
-              .filter(line => !/^[+-]\s*(?:#|\/\/|\/\*|\*|;)/.test(line))
+              .filter(line => {
+                // Keep hunk and file headers
+                if (/^(?:@@|\+\+\+|---)/.test(line)) return true;
+                // Keep changed/context lines that are not comment-only
+                if (/^[+\- ]/.test(line)) {
+                  return !/^[+-]\s*(?:#|\/\/|\/\*|\*|;)/.test(line);
+                }
+                // Drop everything else (bare text, metadata lines, etc.)
+                return false;
+              })
               .join('\n');
             for (const file of changedFiles.slice(0, 10)) {
               if (file.patch) {
@@ -131,7 +148,14 @@ jobs:
                   ? file.patch.slice(0, file.patch.lastIndexOf('\n', 2000)) + '\n... (truncated)'
                   : file.patch;
                 const cleanPatch = stripComments(rawPatch);
-                const entry = `\n**${file.filename}**\n\`\`\`diff\n${cleanPatch}\n\`\`\`\n`;
+                // SECURITY (OWASP LLM01, NIST AI 100-2): Sanitize filename to prevent prompt
+                // injection via attacker-controlled filenames in the PR diff. Strict allowlist
+                // rejects any characters outside safe path characters; truncate to 256 chars.
+                const MAX_FILENAME_LEN = 256;
+                const safeFilename = file.filename
+                  .slice(0, MAX_FILENAME_LEN)
+                  .replace(/[^a-zA-Z0-9._\-\/]/g, '_');
+                const entry = `\n**${safeFilename}**\n\`\`\`diff\n${cleanPatch}\n\`\`\`\n`;
                 if (diffContext.length + entry.length > DIFF_CONTEXT_MAX) {
                   diffContext += '\n... (diff truncated due to size limit)';
                   break;
@@ -171,7 +195,9 @@ jobs:
                     '--exclude-dir=.terraform', '--exclude-dir=.next',
                     '--exclude-dir=bin', '--exclude-dir=obj',
                     '--exclude-dir=packages', '--exclude-dir=.nuget',
-                    '--binary-files=without-match', '--max-count=50',
+                    // SECURITY (L4): --max-count=200 per file (was 50) for better monorepo coverage.
+                    // Total results are capped at 40 lines after collection.
+                    '--binary-files=without-match', '--max-count=200',
                     '.'
                   ],
                   { cwd: process.env.GITHUB_WORKSPACE || '.', encoding: 'utf8', timeout: 20000 }
@@ -246,28 +272,43 @@ jobs:
                 temperature: 0.1
               });
 
-              const response = await fetch(MODELS_API_URL, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
-                },
-                body: requestBody,
-                signal: AbortSignal.timeout(60000)
-              });
+              // SECURITY (L5, NIST SP 800-53 SC-5): Single retry with exponential backoff
+              // for transient 429 (rate-limit) and 503 (service unavailable) responses.
+              const MAX_RETRIES = 1;
+              let response;
+              for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+                response = await fetch(MODELS_API_URL, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+                  },
+                  body: requestBody,
+                  signal: AbortSignal.timeout(60000)
+                });
+                if (attempt < MAX_RETRIES && (response.status === 429 || response.status === 503)) {
+                  const delay = 3000;
+                  console.log(`Models API returned ${response.status}, retrying in ${delay}ms...`);
+                  await new Promise(r => setTimeout(r, delay));
+                  continue;
+                }
+                break;
+              }
 
+              // SECURITY (M2/CWE-367): Check response.ok BEFORE parsing the body to prevent
+              // a malformed error response with a valid JSON choices array from being processed
+              // as legitimate analysis output.
               const responseText = await response.text();
+              if (!response.ok) {
+                console.log(`Models API error: HTTP ${response.status}`);
+                throw new Error(`Models API returned HTTP ${response.status}`);
+              }
               let aiResponse;
               try {
                 aiResponse = JSON.parse(responseText);
               } catch (parseErr) {
                 console.log(`Failed to parse Models API response: HTTP ${response.status}: ${String(parseErr.message).slice(0, 200)}`);
                 throw new Error(`Models API returned non-JSON response (HTTP ${response.status})`);
-              }
-
-              if (!response.ok) {
-                console.log(`Models API error: HTTP ${response.status}`);
-                throw new Error(`Models API returned HTTP ${response.status}`);
               }
 
               if (aiResponse.choices && aiResponse.choices[0]) {
@@ -308,35 +349,73 @@ jobs:
             analysis = analysis.replace(/^\/[a-zA-Z]+/gm, '[command removed]');
             // Strip task list checkboxes to prevent interactive elements in GitHub UI (OWASP LLM02).
             analysis = analysis.replace(/^-\s*\[[ x]\]/gim, '-');
-            // Strip HTML tags to prevent injection (OWASP LLM02).
-            analysis = analysis.replace(/<[^>]*>/g, '');
-            // Strip non-HTTP URI schemes (e.g. ftp:, data:, javascript:).
-            analysis = analysis.replace(/(?:ftp|data|javascript|vbscript):[^\s)\[\]']*/gi, '[link removed]');
-            // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Enforces HTTPS-only for all
-            // trusted domain links. Only exact-match domains are permitted (no subdomains).
-            const trustedDomainRe = /^https:\/\/(?:github\.com|pypi\.org|npmjs\.com|docs\.rs|rubygems\.org|packagist\.org|mvnrepository\.com|nuget\.org|crates\.io)(?:[/?#]|$)/;
+            // Strip HTML tags iteratively to handle nested/reconstructed tags
+            // (OWASP LLM02, CWE-79). E.g. <scr<script>ipt> → <script> after first pass.
+            let prevAnalysis;
+            do {
+              prevAnalysis = analysis;
+              analysis = analysis.replace(/<[^>]*>/g, '');
+            } while (analysis !== prevAnalysis);
+            // Strip any remaining lone < or > characters after tag stripping.
+            analysis = analysis.replace(/[<>]/g, '');
+            // Strip HTML entities that decode to dangerous characters (OWASP LLM02).
+            analysis = analysis.replace(/&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9a-fA-F]+);/gi, '');
+            // SECURITY (H1, OWASP A03:2021, NIST SP 800-53 SI-10): All AI-generated URLs are
+            // stripped from the analysis output. Deterministic registry links are appended
+            // to the comment below, derived solely from validated package metadata.
+            // This eliminates the risk of attacker-controlled resources on trusted domains,
+            // path traversal, encoded character bypasses, and homograph attacks entirely.
+            //
+            // Pre-validation helper: rejects URLs with backslashes, encoded chars in the
+            // domain, or non-ASCII in the domain — all known domain-allowlist bypass vectors.
+            const isUrlDomainSafe = (url) => {
+              if (url.includes('\\')) return false;
+              const domainMatch = url.match(/^https?:\/\/([^/?#]+)/);
+              if (!domainMatch) return false;
+              const domain = domainMatch[1];
+              if (/%[0-9a-fA-F]{2}/.test(domain)) return false;  // encoded chars in domain
+              if (/[^\x00-\x7F]/.test(domain)) return false;       // non-ASCII (homograph)
+              return true;
+            };
+            // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Per-domain path-level allowlist.
+            // Each pattern restricts URLs to known-safe path structures for that registry,
+            // preventing attacker-controlled repo/package pages from being linked.
+            const trustedUrlPatterns = [
+              // GitHub: owner/repo with optional known-safe path segments
+              /^https:\/\/github\.com\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+(?:\/(?:releases|blob|tree|compare|commit|issues|pull|CHANGELOG|CHANGES|HISTORY|NEWS|UPGRADING|BREAKING)[^\s)[\]'"]*)?(?:[?#][^\s)[\]'"]*)?$/,
+              /^https:\/\/pypi\.org\/project\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/(?:www\.)?npmjs\.com\/package\/[a-zA-Z0-9._@/-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/docs\.rs\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/rubygems\.org\/gems\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/packagist\.org\/packages\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/mvnrepository\.com\/artifact\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/(?:www\.)?nuget\.org\/packages\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+              /^https:\/\/crates\.io\/crates\/[a-zA-Z0-9._-]+(?:\/[^\s)[\]'"]*)?$/,
+            ];
+            const isTrustedUrl = (url) => isUrlDomainSafe(url) && trustedUrlPatterns.some(re => re.test(url));
             // Strip URLs that may be open redirects even on trusted domains.
             const suspiciousRedirectRe = /[?&](redirect|return_to|next|url|goto|destination|continue)=/i;
+            // Strip non-HTTP URI schemes (e.g. ftp:, data:, javascript:).
+            analysis = analysis.replace(/(?:ftp|data|javascript|vbscript):[^\s)\[\]']*/gi, '[link removed]');
             // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Strip userinfo from URLs
             // to prevent credential-bearing URL bypass of domain allowlist.
             analysis = analysis.replace(/https?:\/\/[^@\s]*@/g, 'https://');
-            // Strip bare URLs not on the trusted allowlist. The domain must be an exact
-            // match (not a subdomain of an attacker domain like github.com.evil.com).
+            // Strip ALL bare URLs from AI output — replaced by deterministic links below.
             analysis = analysis.replace(
               /https?:\/\/[^\s)[\]'"]+/g,
               url => {
-                if (!trustedDomainRe.test(url)) return '[link removed]';
+                if (!isTrustedUrl(url)) return '[link removed]';
                 if (suspiciousRedirectRe.test(url)) return '[redirect link removed]';
-                return url;
+                return '[link removed]';
               }
             );
-            // Apply the same allowlist to markdown link and image syntax.
+            // Apply the same stripping to markdown link and image syntax.
             analysis = analysis.replace(
               /(!?\[[^\]]*\])\((https?:\/\/[^)]*)\)/g,
               (match, label, url) => {
-                if (!trustedDomainRe.test(url)) return `${label}([link removed])`;
+                if (!isTrustedUrl(url)) return `${label}([link removed])`;
                 if (suspiciousRedirectRe.test(url)) return `${label}([redirect link removed])`;
-                return match;
+                return `${label}([link removed])`;
               }
             );
 
@@ -349,6 +428,40 @@ jobs:
                 `AI analysis may not capture all breaking changes. Please verify before merging.\n\n` + analysis;
             }
 
+            // SECURITY (H1): Deterministic registry links built from validated package metadata.
+            // These replace all AI-generated links stripped above, ensuring only canonical
+            // registry pages are linked — never attacker-controlled resources.
+            const ecosystemLinks = (() => {
+              const filenames = changedFiles.map(f => f.filename);
+              const safePkg = encodeURIComponent(packageName);
+              const links = [];
+              if (filenames.some(f => /requirements.*\.txt$|Pipfile|pyproject\.toml|setup\.(?:py|cfg)/.test(f))) {
+                links.push(`[PyPI: ${packageName}](https://pypi.org/project/${safePkg}/${encodeURIComponent(newVersion)}/)`);
+              }
+              if (filenames.some(f => /package\.json|yarn\.lock|package-lock\.json/.test(f))) {
+                links.push(`[npm: ${packageName}](https://www.npmjs.com/package/${safePkg})`);
+              }
+              if (filenames.some(f => /Gemfile|\.gemspec/.test(f))) {
+                links.push(`[RubyGems: ${packageName}](https://rubygems.org/gems/${safePkg})`);
+              }
+              if (filenames.some(f => /go\.mod$/.test(f))) {
+                links.push(`[pkg.go.dev: ${packageName}](https://pkg.go.dev/${safePkg})`);
+              }
+              if (filenames.some(f => /Cargo\.toml$/.test(f))) {
+                links.push(`[crates.io: ${packageName}](https://crates.io/crates/${safePkg})`);
+              }
+              if (filenames.some(f => /pom\.xml$|\.gradle$/.test(f))) {
+                links.push(`[Maven: ${packageName}](https://mvnrepository.com/artifact/${safePkg})`);
+              }
+              if (filenames.some(f => /\.csproj$|\.fsproj$|\.vbproj$/.test(f))) {
+                links.push(`[NuGet: ${packageName}](https://www.nuget.org/packages/${safePkg})`);
+              }
+              if (filenames.some(f => /composer\.json$/.test(f))) {
+                links.push(`[Packagist: ${packageName}](https://packagist.org/packages/${safePkg})`);
+              }
+              return links;
+            })();
+
             // 7. Post the Copilot analysis as a PR comment.
             const commentBody = [
               '## 🤖 Copilot Dependency Analysis',
@@ -357,6 +470,11 @@ jobs:
               '',
               analysis,
               '',
+              ...(ecosystemLinks.length > 0 ? [
+                '**Registry References:**',
+                ecosystemLinks.join(' · '),
+                '',
+              ] : []),
               '---',
               '> ⚠️ *This is an AI-generated analysis and may contain inaccuracies or hallucinations. Manual review is always recommended before merging dependency updates.*',
               '',
@@ -371,12 +489,18 @@ jobs:
             console.log(`✅ Posted Copilot analysis for ${packageName} (${oldVersion} → ${newVersion}) on PR #${prNumber}`);
 
             // Structured audit log for SIEM integration (NIST AI 100-2).
+            // SECURITY (L2, NIST SP 800-53 AU-3, OWASP A09:2021): Explicitly re-sanitize all
+            // user-derived values before structured logging to prevent log injection even if
+            // upstream validation is ever relaxed.
+            const logPkgName = packageName.replace(/[^a-zA-Z0-9._\-/@]/g, '').slice(0, MAX_PKG_NAME_LEN);
+            const logOldVer  = oldVersion.replace(/[^a-zA-Z0-9._\-+]/g, '').slice(0, MAX_VERSION_LEN);
+            const logNewVer  = newVersion.replace(/[^a-zA-Z0-9._\-+]/g, '').slice(0, MAX_VERSION_LEN);
             console.log(JSON.stringify({
               event: 'copilot_dependabot_analysis',
               pr_number: prNumber,
-              package: packageName,
-              old_version: oldVersion,
-              new_version: newVersion,
+              package: logPkgName,
+              old_version: logOldVer,
+              new_version: logNewVer,
               package_is_used: packageIsUsed,
               analysis_length: analysis.length,
               timestamp: new Date().toISOString()
