@@ -228,8 +228,8 @@ jobs:
               `Analyze the following dependency upgrade for breaking changes.\n\n` +
               `Format your response as:\n\n` +
               `**Status:** ⚠️ Breaking Changes Detected  _or_  ✅ No Breaking Changes Detected\n\n` +
-              `**Breaking Changes Found:**\n` +
-              `_(List each breaking change with the version it was introduced, or "None detected.")_\n\n` +
+              `**Changelog Summary:**\n` +
+              `_(List each notable change with the version it was introduced. If breaking changes exist, call them out explicitly. If none, summarize what changed.)_\n\n` +
               `**Impact on This Repository:**\n` +
               `_(List affected files and line numbers, or "No direct impact detected.")_\n\n` +
               `**Required Actions Before Merging:**\n` +
@@ -360,11 +360,13 @@ jobs:
             analysis = analysis.replace(/[<>]/g, '');
             // Strip HTML entities that decode to dangerous characters (OWASP LLM02).
             analysis = analysis.replace(/&(?:lt|gt|amp|quot|apos|#\d+|#x[0-9a-fA-F]+);/gi, '');
-            // SECURITY (H1, OWASP A03:2021, NIST SP 800-53 SI-10): All AI-generated URLs are
-            // stripped from the analysis output. Deterministic registry links are appended
-            // to the comment below, derived solely from validated package metadata.
-            // This eliminates the risk of attacker-controlled resources on trusted domains,
-            // path traversal, encoded character bypasses, and homograph attacks entirely.
+            // SECURITY (H1, OWASP A03:2021, NIST SP 800-53 SI-10): AI-generated URLs are
+            // validated against a trusted registry allowlist. URLs matching known-safe package
+            // registry patterns are preserved; all others are stripped from the analysis output.
+            // Deterministic registry links are also appended to the comment below, derived
+            // solely from validated package metadata.
+            // This eliminates the risk of attacker-controlled resources on untrusted domains,
+            // path traversal, encoded character bypasses, and homograph attacks.
             //
             // Pre-validation helper: rejects URLs with backslashes, encoded chars in the
             // domain, or non-ASCII in the domain — all known domain-allowlist bypass vectors.
@@ -400,22 +402,22 @@ jobs:
             // SECURITY (OWASP A03:2021, NIST SP 800-53 SI-10): Strip userinfo from URLs
             // to prevent credential-bearing URL bypass of domain allowlist.
             analysis = analysis.replace(/https?:\/\/[^@\s]*@/g, 'https://');
-            // Strip ALL bare URLs from AI output — replaced by deterministic links below.
+            // Strip untrusted bare URLs from AI output; preserve URLs matching trusted registry patterns.
             analysis = analysis.replace(
               /https?:\/\/[^\s)[\]'"]+/g,
               url => {
                 if (!isTrustedUrl(url)) return '[link removed]';
                 if (suspiciousRedirectRe.test(url)) return '[redirect link removed]';
-                return '[link removed]';
+                return url;
               }
             );
-            // Apply the same stripping to markdown link and image syntax.
+            // Apply the same policy to markdown link and image syntax.
             analysis = analysis.replace(
               /(!?\[[^\]]*\])\((https?:\/\/[^)]*)\)/g,
               (match, label, url) => {
                 if (!isTrustedUrl(url)) return `${label}([link removed])`;
                 if (suspiciousRedirectRe.test(url)) return `${label}([redirect link removed])`;
-                return `${label}([link removed])`;
+                return match;
               }
             );
 
@@ -428,9 +430,12 @@ jobs:
                 `AI analysis may not capture all breaking changes. Please verify before merging.\n\n` + analysis;
             }
 
-            // SECURITY (H1): Deterministic registry links built from validated package metadata.
-            // These replace all AI-generated links stripped above, ensuring only canonical
-            // registry pages are linked — never attacker-controlled resources.
+            // SECURITY (H1, OWASP A03:2021, NIST SP 800-53 SI-10): AI-generated URLs that
+            // do not match the trusted registry allowlist are stripped from the analysis output.
+            // URLs matching trusted patterns (e.g. GitHub, PyPI, npm, crates.io) are preserved
+            // to provide useful changelog and release note links to reviewers.
+            // Deterministic registry links are also appended below, derived solely from
+            // validated package metadata.
             const ecosystemLinks = (() => {
               const filenames = changedFiles.map(f => f.filename);
               const safePkg = encodeURIComponent(packageName);
