@@ -27,5 +27,5 @@ google-cloud-iot
 google-cloud-logging==3.5.0
 requests==2.31.0
 netaddr==0.8.0
-Werkzeug==2.3.4
+Werkzeug==3.1.6
 WTForms==3.0.1
